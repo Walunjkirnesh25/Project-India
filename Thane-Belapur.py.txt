@@ -1,0 +1,252 @@
+// Thane–Belapur Industrial Belt : Water & Air Pollution Trend (1990–2025)
+
+
+// ---- ROI 
+var roi = ee.Geometry.Rectangle([72.92, 18.95, 73.12, 19.12]); // Thane–Belapur corridor
+Map.centerObject(roi, 11);
+Map.addLayer(roi, {color: 'red'}, 'ROI');
+
+// ---------- Utility: safe band getter (returns an image with single band named `name`)
+function safeBand(img, name) {
+  return ee.Image(ee.Algorithms.If(
+    img.bandNames().contains(name),
+    img.select([name]),
+    ee.Image.constant(0).rename(name)
+  ));
+}
+
+// Add harmonized bands for Landsat
+function addLandsatBands(img) {
+  var bnames = img.bandNames();
+  var isL8 = bnames.contains('SR_B6');
+
+  var swirSrc = ee.Algorithms.If(isL8, safeBand(img, 'SR_B6'), safeBand(img, 'SR_B5'));
+  var redSrc  = ee.Algorithms.If(isL8, safeBand(img, 'SR_B4'), safeBand(img, 'SR_B3'));
+  var nirSrc  = ee.Algorithms.If(isL8, safeBand(img, 'SR_B5'), safeBand(img, 'SR_B4'));
+  var greenSrc= ee.Algorithms.If(isL8, safeBand(img, 'SR_B3'), safeBand(img, 'SR_B2'));
+
+  var swir = ee.Image(swirSrc).rename('swir').toFloat();
+  var red  = ee.Image(redSrc).rename('red').toFloat();
+  var nir  = ee.Image(nirSrc).rename('nir').toFloat();
+  var green= ee.Image(greenSrc).rename('green').toFloat();
+
+  return img.addBands([swir, red, nir, green]);
+}
+
+// Sentinel-2 Bands
+function addS2Bands(img) {
+  var swir = safeBand(img, 'B11').rename('swir').toFloat();
+  var red  = safeBand(img, 'B4').rename('red').toFloat();
+  var nir  = safeBand(img, 'B8').rename('nir').toFloat();
+  var green= safeBand(img, 'B3').rename('green').toFloat();
+  return img.addBands([swir, red, nir, green]);
+}
+
+//Indices
+function ndwiFromBands(img) {
+  return img.expression('(g - n) / (g + n)', {
+    'g': img.select('green'),
+    'n': img.select('nir')
+  }).rename('NDWI');
+}
+function ndtiFromBands(img) {
+  return img.expression('(s - r) / (s + r)', {
+    's': img.select('swir'),
+    'r': img.select('red')
+  }).rename('NDTI');
+}
+
+//Load Collections
+var ls5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').filterBounds(roi);
+var ls7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').filterBounds(roi);
+var ls8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').filterBounds(roi);
+var s2  = ee.ImageCollection('COPERNICUS/S2_SR').filterBounds(roi);
+
+//Prepare Landsat
+function prepLandsat(coll) {
+  return coll.map(function(img) {
+    var hasQA = img.bandNames().contains('QA_PIXEL');
+    var mask = ee.Image(ee.Algorithms.If(hasQA,
+      img.select('QA_PIXEL').bitwiseAnd(1 << 3).eq(0),
+      ee.Image(1)
+    ));
+    img = img.updateMask(mask);
+
+    // Add harmonized bands (safe)
+    img = addLandsatBands(img);
+
+    // Compute indices
+    var ndwi = ndwiFromBands(img);
+    var ndti = ndtiFromBands(img);
+
+    // Build final homogeneous image containing only these bands
+    var concatenated = ee.Image.cat([
+      img.select('swir'),
+      img.select('red'),
+      img.select('nir'),
+      img.select('green'),
+      ndwi,
+      ndti
+    ]);
+    
+    var out = ee.Image(concatenated).rename(['swir','red','nir','green','NDWI','NDTI'])
+      .copyProperties(img, ['system:time_start']);
+    return out;
+  });
+}
+
+// Merge Landsat collections first (safe) and then prepare per-image
+var mergedLandsatCollection = ls5.merge(ls7).merge(ls8);
+var landsat = prepLandsat(mergedLandsatCollection);
+
+//  Prepare Sentinel-2
+var sentinel2 = s2
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+  .map(function(img) {
+    img = addS2Bands(img);
+    var ndwi = ndwiFromBands(img);
+    var ndti = ndtiFromBands(img);
+
+    var concatenated = ee.Image.cat([
+      img.select('swir'),
+      img.select('red'),
+      img.select('nir'),
+      img.select('green'),
+      ndwi,
+      ndti
+    ]);
+    var out = ee.Image(concatenated).rename(['swir','red','nir','green','NDWI','NDTI'])
+      .copyProperties(img, ['system:time_start']);
+    return out;
+  });
+
+//Annual composites 1990–2025
+var years = ee.List.sequence(1990, 2025);
+var annual = ee.FeatureCollection(years.map(function(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end = start.advance(1, 'year');
+
+  // combine landsat + sentinel for the year
+  var coll = landsat.filterDate(start, end).merge(sentinel2.filterDate(start, end));
+
+  var med = ee.Algorithms.If(
+    coll.size().gt(0),
+    coll.median().select(['NDWI', 'NDTI']),
+    ee.Image.constant([0, 0]).rename(['NDWI', 'NDTI'])
+  );
+  med = ee.Image(med);
+
+  var meanNDWI = med.select('NDWI').reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: roi, scale: 30, maxPixels: 1e9
+  }).get('NDWI');
+
+  var meanNDTI = med.select('NDTI').reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: roi, scale: 30, maxPixels: 1e9
+  }).get('NDTI');
+
+  return ee.Feature(null, {'year': y, 'NDWI': meanNDWI, 'NDTI': meanNDTI});
+}));
+
+print('Annual NDWI & NDTI (1990–2025):', annual);
+
+// Charts 
+print(ui.Chart.feature.byFeature(annual, 'year', ['NDTI'])
+  .setOptions({
+    title: 'Thane-Belapur: Water Turbidity (NDTI Proxy) 1990–2025',
+    vAxis: {title: 'NDTI (↑ = more turbidity)'},
+    hAxis: {title: 'Year'}, lineWidth: 2, pointSize: 4
+  })
+);
+
+print(ui.Chart.feature.byFeature(annual, 'year', ['NDWI'])
+  .setOptions({
+    title: 'Thane-Belapur: Water Index (NDWI Proxy) 1990–2025',
+    vAxis: {title: 'NDWI (↓ = less water health)'},
+    hAxis: {title: 'Year'}, lineWidth: 2, pointSize: 4
+  })
+);
+
+// Visual layers 
+var recent = ee.ImageCollection(landsat.merge(sentinel2))
+  .filterDate('2022-01-01', '2022-12-31').median();
+
+Map.addLayer(recent.select('NDWI'), {min:-1, max:1, palette:['white','blue']}, 'NDWI 2022');
+Map.addLayer(recent.select('NDTI'), {min:-0.4, max:0.6, palette:['green','yellow','red']}, 'NDTI 2022');
+
+//MODIS AOD (air pollution proxy, 2001+)
+var modisAOD = ee.ImageCollection('MODIS/061/MCD19A2_GRANULES')
+  .filterBounds(roi)
+  .filterDate('2001-01-01', '2025-12-31')
+  .select('Optical_Depth_047');
+
+var aodAnnual = ee.FeatureCollection(years.map(function(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end = start.advance(1, 'year');
+  var coll = modisAOD.filterDate(start, end);
+  var meanAOD = ee.Algorithms.If(coll.size().gt(0),
+    coll.mean().reduceRegion({reducer: ee.Reducer.mean(), geometry: roi, scale: 1000, maxPixels: 1e9}).get('Optical_Depth_047'),
+    0);
+  return ee.Feature(null, {'year': y, 'AOD': meanAOD});
+}));
+print('Annual AOD:', aodAnnual);
+
+print(ui.Chart.feature.byFeature(aodAnnual, 'year', ['AOD'])
+  .setOptions({
+    title: 'Thane-Belapur: Aerosol Optical Depth (MODIS AOD) 2001–2025',
+    vAxis: {title: 'AOD (↑ = hazier air)'}, hAxis: {title: 'Year'},
+    lineWidth: 2, pointSize: 4
+  })
+);
+
+// Sentinel-5P NO₂ (1990+)
+var s5p = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_NO2')
+  .select('tropospheric_NO2_column_number_density')
+  .filterBounds(roi)
+  .filterDate('1990-01-01', '2025-12-31');
+
+var s5pAnnual = ee.FeatureCollection(ee.List.sequence(1990, 2025).map(function(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end = start.advance(1, 'year');
+  var coll = s5p.filterDate(start, end);
+  var meanNO2 = ee.Algorithms.If(coll.size().gt(0),
+    coll.mean().reduceRegion({reducer: ee.Reducer.mean(), geometry: roi, scale: 1000, maxPixels: 1e9}).get('tropospheric_NO2_column_number_density'),
+    0);
+  return ee.Feature(null, {'year': y, 'NO2': meanNO2});
+}));
+print('Annual NO₂:', s5pAnnual);
+
+print(ui.Chart.feature.byFeature(s5pAnnual, 'year', ['NO2'])
+  .setOptions({
+    title: 'Thane-Belapur: Tropospheric NO₂ (1990–2025)',
+    vAxis: {title: 'NO₂ (mol/m²)'}, hAxis: {title: 'Year'},
+    lineWidth: 2, pointSize: 4
+  })
+);
+
+var recentNO2 = s5p.filterDate('2023-01-01', '2023-12-31').mean();
+Map.addLayer(recentNO2.clip(roi), {min:0, max:0.0002}, 'NO₂ 2023');
+
+// Hotspot (high NDTI)
+var ndti2022img = recent.select('NDTI').clip(roi);
+var hotspot = ndti2022img.gt(0.2);
+Map.addLayer(hotspot.updateMask(hotspot), {palette:['red']}, 'High Turbidity Hotspots (2022)');
+
+//  Export CSV summaries 
+Export.table.toDrive({
+  collection: annual,
+  description: 'ThaneBelapur_NDWI_NDTI_1990_2025',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: aodAnnual,
+  description: 'ThaneBelapur_AOD_2001_2025',
+  fileFormat: 'CSV'
+});
+Export.table.toDrive({
+  collection: s5pAnnual,
+  description: 'ThaneBelapur_NO2_1990_2025',
+  fileFormat: 'CSV'
+});
